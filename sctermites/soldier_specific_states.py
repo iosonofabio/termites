@@ -32,6 +32,24 @@ species_full_dict = {
     "rspe": "Reticulitermes speratus",
 }
 
+protein_seqs_dict = {
+    # Perfect genome matches
+    "dmel": ["d_melanogaster.h5ad", "d_melanogaster_gene_all_esm1b.pt"],
+    "znev": ["znev.h5ad", "Znev_proteins_rep.faa"],
+    "ofor": ["ofor.h5ad", "Ofor_proteins_rep.faa"],
+    "mdar": ["mdar.h5ad", "Mdar_proteins_rep.faa"],
+    "hsjo": ["hsjo.h5ad", "Hsjo_proteins_rep.faa"],
+    "gfus": ["gfus.h5ad", "Gfus_proteins_rep.faa"],
+    # Imperfect genome matches
+    "imin": ["imin.h5ad", "Isch_proteins_rep.faa"],
+    "cfor": ["cfor.h5ad", "Cges_proteins_rep.faa"],
+    "nsug": ["nsug.h5ad", "Ncas_proteins_rep.faa"],
+    "pnit": ["pnit.h5ad", "Punk_proteins_rep.faa"],
+    "cpun": ["cpun.h5ad", "Cmer_proteins_rep.faa"],
+    "roki": ["roki.h5ad", "Rfla_proteins_rep.faa"],
+    "rspe": ["rspe.h5ad", "Rfla_proteins_rep.faa"],
+}
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -307,6 +325,130 @@ if __name__ == "__main__":
         ax.set_title(species)
     fig.suptitle(f"{focus_cell_type} across species and castes", fontsize=16)
     fig.tight_layout()
+
+    print("Differential expression between soldier and king...")
+    degsd = {}
+    for species_code, adata_species in adatad.items():
+        adata_species_focus = adata_species[
+            (adata_species.obs["cell_type_znev_based"] == focus_cell_type)
+            & adata_species.obs["caste"].isin(["soldier", "king"]),
+        ]
+        sc.tl.rank_genes_groups(
+            adata_species_focus,
+            "caste",
+            method="wilcoxon",
+            groups=["soldier"],
+            reference="king",
+        )
+        tmpi = adata_species_focus.uns["rank_genes_groups"]
+        degs = pd.DataFrame(
+            {
+                "score": tmpi["scores"]["soldier"],
+                "logfoldchanges": tmpi["logfoldchanges"]["soldier"],
+                "pvals_adj": tmpi["pvals_adj"]["soldier"],
+            },
+            index=tmpi["names"]["soldier"],
+        )
+        degsd[species_code] = degs
+
+    def get_protein_sequences(species, genes):
+        """Extract protein sequence from fasta file for a species and gene."""
+        from Bio.SeqIO import FastaIO
+
+        genes_left = set(genes)
+        seqs = {}
+
+        fn = protein_seqs_dict[species][1]
+        fn = f"data/all_species/protein_coding_genes_fasta/{fn}"
+        with open(fn) as handle:
+            for protein_name, seq in FastaIO.SimpleFastaParser(handle):
+                gene_name = protein_name.split("-")[0]
+                if gene_name in genes_left:
+                    genes_left.remove(gene_name)
+                    seqs[gene_name] = seq
+                if len(genes_left) == 0:
+                    break
+
+        if len(seqs) == 0:
+            raise ValueError(
+                f"No sequences found for genes {genes} in species {species}"
+            )
+        return seqs
+
+    def blast_genes_dmel(protein_seqd):
+        import subprocess as sp
+        from Bio import Blast
+
+        gene_names, protein_seqs = zip(*protein_seqd.items())
+
+        tmp_file = "/tmp/blasttmp/gene.fasta"
+        tmp_fileout = "/tmp/blasttmp/blast_result.xml"
+
+        with open(tmp_file, "w") as f:
+            for gene_name, protein_seq in zip(gene_names, protein_seqs):
+                f.write(f">{gene_name}\n{protein_seq}\n")
+
+        sp.run(
+            f"blastp -query {tmp_file} -db data/drosophila_refs/d_melanogaster.fasta -out {tmp_fileout} -outfmt 5",
+            shell=True,
+        )
+
+        dmel_genes = {}
+        with open(tmp_fileout, "rb") as result_stream:
+            for blast_record in Blast.parse(result_stream):
+                if len(blast_record) == 0:
+                    continue
+                src_gene = blast_record.query.description
+                if src_gene in dmel_genes:
+                    continue
+                hit = blast_record[0].target.id
+                dmel_genes[src_gene] = hit
+
+        os.remove(tmp_file)
+        os.remove(tmp_fileout)
+
+        for gene in gene_names:
+            if gene not in dmel_genes:
+                dmel_genes[gene] = ""
+        dmel_genes = pd.Series(dmel_genes)
+
+        return dmel_genes
+
+    def annotate_genes_with_dmel(species_code, genes):
+        print("Get protein sequences...")
+        protein_sequenced = get_protein_sequences(species_code, genes)
+
+        print("BLASTing to Dmel...")
+        blast_records = blast_genes_dmel(protein_sequenced)
+        return blast_records
+
+    dmel_genesd = {}
+    for species_code in ["imin", "pnit", "roki", "mdar"]:
+        print(f"Looking for soldier muscle markers for species {species_code}...")
+        dmel_genes = annotate_genes_with_dmel(
+            species_code,
+            degsd[species_code].index[:10],
+        )
+        tmp = []
+        dmel_genes.index.name = "original"
+        dmel_genes = dmel_genes.to_frame(name="dmel").reset_index()
+        dmel_genes["up_in"] = "soldier"
+        tmp.append(dmel_genes)
+
+        dmel_genes = annotate_genes_with_dmel(
+            species_code,
+            degsd[species_code].index[-10:][::-1],
+        )
+        dmel_genes.index.name = "original"
+        dmel_genes = dmel_genes.to_frame(name="dmel").reset_index()
+        dmel_genes["up_in"] = "king"
+        tmp.append(dmel_genes)
+
+        dmel_genes = pd.concat(tmp, axis=0)
+        dmel_genes["species"] = species_code
+
+        dmel_genesd[species_code] = dmel_genes
+    dmel_genes = pd.concat(dmel_genesd.values())
 
     plt.ion()
     plt.show()
