@@ -375,80 +375,146 @@ if __name__ == "__main__":
             )
         return seqs
 
-    def blast_genes_dmel(protein_seqd):
+    def blast_genes_dmel(proteins_info):
         import subprocess as sp
         from Bio import Blast
 
-        gene_names, protein_seqs = zip(*protein_seqd.items())
-
+        os.makedirs("/tmp/blasttmp", exist_ok=True)
         tmp_file = "/tmp/blasttmp/gene.fasta"
         tmp_fileout = "/tmp/blasttmp/blast_result.xml"
-
         with open(tmp_file, "w") as f:
-            for gene_name, protein_seq in zip(gene_names, protein_seqs):
-                f.write(f">{gene_name}\n{protein_seq}\n")
+            for species_code, _, _, gene_name, protein_seq in proteins_info:
+                f.write(f">{gene_name}|{species_code}\n{protein_seq}\n")
 
         sp.run(
             f"blastp -query {tmp_file} -db data/drosophila_refs/d_melanogaster.fasta -out {tmp_fileout} -outfmt 5",
             shell=True,
         )
 
-        dmel_genes = {}
+        dmel_genes = defaultdict(list)
         with open(tmp_fileout, "rb") as result_stream:
             for blast_record in Blast.parse(result_stream):
                 if len(blast_record) == 0:
                     continue
-                src_gene = blast_record.query.description
-                if src_gene in dmel_genes:
+                src_gene, species_code = blast_record.query.description.split("|")
+                if (src_gene, species_code) in dmel_genes:
                     continue
-                hit = blast_record[0].target.id
-                dmel_genes[src_gene] = hit
+                for rank, hit in enumerate(blast_record[:3], 1):
+                    tgt_gene = hit.target.id
+                    dmel_genes[(src_gene, species_code)].append((tgt_gene, rank))
 
         os.remove(tmp_file)
         os.remove(tmp_fileout)
 
-        for gene in gene_names:
-            if gene not in dmel_genes:
-                dmel_genes[gene] = ""
-        dmel_genes = pd.Series(dmel_genes)
+        result = []
+        for species_code, up_in, rank_deg, gene_name, protein_seq in proteins_info:
+            if (gene_name, species_code) in dmel_genes:
+                for dmel_gene, rank_blast in dmel_genes[(gene_name, species_code)]:
+                    result.append(
+                        [
+                            species_code,
+                            up_in,
+                            rank_deg,
+                            gene_name,
+                            dmel_gene,
+                            rank_blast,
+                        ]
+                    )
+        result_df = pd.DataFrame(
+            result,
+            columns=[
+                "species_code",
+                "up_in",
+                "rank_deg",
+                "gene_name",
+                "dmel_gene",
+                "rank_blast",
+            ],
+        )
+        return result_df
 
-        return dmel_genes
-
-    def annotate_genes_with_dmel(species_code, genes):
+    def annotate_genes_with_dmel(genesd):
         print("Get protein sequences...")
-        protein_sequenced = get_protein_sequences(species_code, genes)
+
+        proteins_info = []
+        for species_code, genes_bothd in genesd.items():
+            for up_in, genes in genes_bothd.items():
+                protein_sequenced = get_protein_sequences(species_code, genes)
+                for rank, gene in enumerate(genes, 1):
+                    if gene in protein_sequenced:
+                        seq = protein_sequenced[gene]
+                        proteins_info.append((species_code, up_in, rank, gene, seq))
 
         print("BLASTing to Dmel...")
-        blast_records = blast_genes_dmel(protein_sequenced)
+        blast_records = blast_genes_dmel(proteins_info)
         return blast_records
 
-    dmel_genesd = {}
-    for species_code in ["imin", "pnit", "roki", "mdar"]:
-        print(f"Looking for soldier muscle markers for species {species_code}...")
-        dmel_genes = annotate_genes_with_dmel(
-            species_code,
-            degsd[species_code].index[:10],
+    genesd = {}
+    for species_code in ["imin", "pnit", "roki", "mdar", "nsug"]:
+        print(f"Looking for soldier/king muscle markers for species {species_code}...")
+        genes_bothd = {
+            "soldier": degsd[species_code].index[:10],
+            "king": degsd[species_code].index[-10:][::-1],
+        }
+        genesd[species_code] = genes_bothd
+
+    dmel_genes = annotate_genes_with_dmel(
+        genesd,
+    )
+
+    print("Plot specific genes...")
+    dmel_gene_list = dmel_genes["dmel_gene"].value_counts().index[:10]
+    palette = {
+        "king": "#1f77b4",
+        "queen": "#ff7f0e",
+        "soldier": "#2ca05c",
+        "worker": "#962758",
+        "n/a": "#7f7f7f",
+    }
+    for dmel_gene in dmel_gene_list:
+        rows = dmel_genes[dmel_genes["dmel_gene"] == dmel_gene]
+        species_codes = rows["species_code"].unique()
+
+        fig, axs = plt.subplots(
+            1,
+            len(species_codes),
+            figsize=(4 * len(species_codes), 4),
         )
-        tmp = []
-        dmel_genes.index.name = "original"
-        dmel_genes = dmel_genes.to_frame(name="dmel").reset_index()
-        dmel_genes["up_in"] = "soldier"
-        tmp.append(dmel_genes)
-
-        dmel_genes = annotate_genes_with_dmel(
-            species_code,
-            degsd[species_code].index[-10:][::-1],
-        )
-        dmel_genes.index.name = "original"
-        dmel_genes = dmel_genes.to_frame(name="dmel").reset_index()
-        dmel_genes["up_in"] = "king"
-        tmp.append(dmel_genes)
-
-        dmel_genes = pd.concat(tmp, axis=0)
-        dmel_genes["species"] = species_code
-
-        dmel_genesd[species_code] = dmel_genes
-    dmel_genes = pd.concat(dmel_genesd.values())
+        linestyles = ["-", "--", "-.", ":"]
+        for ax, species_code in zip(axs, species_codes):
+            adata_species = adatad[species_code]
+            row_species = rows[rows["species_code"] == species_code]
+            for gene, ls in zip(row_species["gene_name"].values, linestyles):
+                for caste in ["soldier", "king"]:
+                    x = (
+                        adata_species[
+                            (adata_species.obs["caste"] == caste)
+                            & (
+                                adata_species.obs["cell_type_znev_based"]
+                                == focus_cell_type
+                            ),
+                            gene,
+                        ]
+                        .X.toarray()
+                        .ravel()
+                    )
+                    ax.ecdf(
+                        x,
+                        label=f"{gene} in {caste}",
+                        ls=ls,
+                        complementary=True,
+                        color=palette[caste],
+                        lw=2,
+                    )
+            ax.set_yscale("log")
+            ax.grid(True)
+            ax.legend()
+            ax.set_title(species_full_dict[species_code])
+            ax.set_xlabel("Expression level [log1p(cptt)]")
+        axs[0].set_ylabel(f"Fraction of {focus_cell_type}s\nabove expression level")
+        fig.suptitle("Homologs of Dmel gene " + dmel_gene, fontsize=16)
+        fig.tight_layout()
+        # fig.savefig("figures/soldier_king_muscle_specific_genes_" + dmel_gene + ".png")
 
     plt.ion()
     plt.show()
